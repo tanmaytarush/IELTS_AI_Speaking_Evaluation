@@ -25,6 +25,15 @@ const questions = {
   ]
 };
 
+// IELTS timing constraints (in minutes)
+const IELTS_TIMING = {
+  1: { duration: 4, questionsPerTopic: 3, topics: 2 },
+  2: { duration: 3, preparationTime: 1, speakingTime: 2 },
+  3: { duration: 5, questions: 4 }
+} as const;
+
+type TimingConfig = typeof IELTS_TIMING[keyof typeof IELTS_TIMING];
+
 interface DetailedAnalysis {
   assessment: string;
   strengths: string[];
@@ -56,6 +65,14 @@ interface ConversationMessage {
   audioUrl?: string;
 }
 
+interface TestSession {
+  startTime: Date;
+  currentTopic: number;
+  questionsAsked: number;
+  totalQuestions: number;
+  isComplete: boolean;
+}
+
 export default function Home() {
   const [testPart, setTestPart] = useState(1);
   const [question, setQuestion] = useState('');
@@ -69,18 +86,123 @@ export default function Home() {
   const [isListening, setIsListening] = useState(false);
   const [examinerSpeaking, setExaminerSpeaking] = useState(false);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [testSession, setTestSession] = useState<TestSession | null>(null);
+  const [timeRemaining, setTimeRemaining] = useState<number>(0);
+  const [testComplete, setTestComplete] = useState(false);
+  const [allTranscriptions, setAllTranscriptions] = useState<string[]>([]);
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioQueueRef = useRef<HTMLAudioElement[]>([]);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Initialize test session and timing
+  const initializeTestSession = () => {
+    const timing = IELTS_TIMING[testPart as keyof typeof IELTS_TIMING];
+    let totalQuestions: number;
+    
+    if (testPart === 1) {
+      const part1Timing = timing as typeof IELTS_TIMING[1];
+      totalQuestions = part1Timing.questionsPerTopic * part1Timing.topics;
+    } else if (testPart === 2) {
+      totalQuestions = 1; // Part 2 has one main question
+    } else {
+      const part3Timing = timing as typeof IELTS_TIMING[3];
+      totalQuestions = part3Timing.questions;
+    }
+    
+    const session: TestSession = {
+      startTime: new Date(),
+      currentTopic: 1,
+      questionsAsked: 0,
+      totalQuestions,
+      isComplete: false
+    };
+    setTestSession(session);
+    setTimeRemaining(timing.duration * 60); // Convert to seconds
+    setAllTranscriptions([]);
+    setTestComplete(false);
+  };
+
+  // Timer countdown
+  useEffect(() => {
+    if (conversationMode && testSession && timeRemaining > 0) {
+      timerRef.current = setInterval(() => {
+        setTimeRemaining(prev => {
+          if (prev <= 1) {
+            endTest();
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, [conversationMode, testSession, timeRemaining]);
+
+  const endTest = async () => {
+    if (testSession) {
+      setTestSession(prev => prev ? { ...prev, isComplete: true } : null);
+      setTestComplete(true);
+      
+      // Combine all transcriptions for final evaluation
+      const combinedTranscription = allTranscriptions.join(' ');
+      
+      if (combinedTranscription.trim()) {
+        await evaluateCompleteTest(combinedTranscription);
+      }
+      
+      // Speak test completion message
+      const completionMessage = "Thank you. That concludes your IELTS Speaking test. I will now provide you with your evaluation.";
+      await speakText(completionMessage);
+      
+      const examinerMessage: ConversationMessage = {
+        role: 'assistant',
+        content: completionMessage,
+        timestamp: new Date()
+      };
+      setConversation(prev => [...prev, examinerMessage]);
+    }
+  };
+
+  const evaluateCompleteTest = async (fullTranscription: string) => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          transcription: fullTranscription, 
+          testPart,
+          isCompleteTest: true 
+        })
+      });
+      
+      if (!res.ok) throw new Error('Evaluation failed');
+      
+      const data = await res.json();
+      setEvaluation(data);
+    } catch (error) {
+      console.error('Evaluation error:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Initialize conversation with examiner introduction and first question
   useEffect(() => {
     if (conversationMode && conversation.length === 0) {
+      initializeTestSession();
+      
       const examinerIntro = {
         role: 'assistant' as const,
-        content: `Hello! I'm your IELTS Speaking examiner. Welcome to Part ${testPart} of your IELTS Speaking test. Let's begin.`,
+        content: `Hello! I'm your IELTS Speaking examiner. Welcome to Part ${testPart} of your IELTS Speaking test. This part will last ${IELTS_TIMING[testPart as keyof typeof IELTS_TIMING].duration} minutes. Let's begin.`,
         timestamp: new Date()
       };
       
@@ -212,6 +334,8 @@ export default function Home() {
   };
 
   const processUserResponse = async (userText: string) => {
+    if (!testSession || testSession.isComplete) return;
+    
     // Add user message to conversation
     const userMessage: ConversationMessage = {
       role: 'user',
@@ -221,6 +345,22 @@ export default function Home() {
     
     setConversation(prev => [...prev, userMessage]);
     
+    // Add to transcriptions for final evaluation
+    setAllTranscriptions(prev => [...prev, userText]);
+    
+    // Update test session
+    const updatedSession = {
+      ...testSession,
+      questionsAsked: testSession.questionsAsked + 1
+    };
+    setTestSession(updatedSession);
+    
+    // Check if test should end
+    if (updatedSession.questionsAsked >= updatedSession.totalQuestions) {
+      endTest();
+      return;
+    }
+    
     // Get intelligent examiner response from API
     try {
       const res = await fetch('/api/conversation', {
@@ -229,7 +369,10 @@ export default function Home() {
         body: JSON.stringify({ 
           userResponse: userText, 
           testPart,
-          conversationHistory: conversation
+          conversationHistory: conversation,
+          questionsAsked: updatedSession.questionsAsked,
+          totalQuestions: updatedSession.totalQuestions,
+          timeRemaining
         })
       });
       
@@ -237,6 +380,12 @@ export default function Home() {
       
       const data = await res.json();
       const examinerResponse = data.examinerResponse;
+      
+      // Check if test is complete
+      if (data.testComplete) {
+        endTest();
+        return;
+      }
       
       // Add examiner response to conversation
       const examinerMessage: ConversationMessage = {
@@ -276,12 +425,26 @@ export default function Home() {
     setConversation([]);
     setCurrentQuestionIndex(0);
     setEvaluation(null);
+    setTestComplete(false);
   };
 
   const stopConversationMode = () => {
     setConversationMode(false);
     setConversation([]);
     setExaminerSpeaking(false);
+    setTestSession(null);
+    setTimeRemaining(0);
+    setTestComplete(false);
+    setAllTranscriptions([]);
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   return (
@@ -309,6 +472,24 @@ export default function Home() {
       {conversationMode ? (
         /* Voice Conversation Mode */
         <div className="space-y-6">
+          {/* Timer and Test Progress */}
+          <div className="bg-yellow-50 p-4 rounded-lg">
+            <div className="flex justify-between items-center">
+              <div>
+                <h3 className="font-semibold text-yellow-800">⏱️ Test Timer</h3>
+                <p className="text-yellow-700">Time Remaining: {formatTime(timeRemaining)}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-sm text-yellow-700">
+                  Questions: {testSession?.questionsAsked || 0}/{testSession?.totalQuestions || 0}
+                </p>
+                <p className="text-sm text-yellow-700">
+                  Part {testPart} of 3
+                </p>
+              </div>
+            </div>
+          </div>
+
           <div className="bg-green-50 p-4 rounded-lg">
             <h3 className="font-semibold text-green-800">🎙️ Voice Conversation Mode</h3>
             <p className="text-green-700">
@@ -319,10 +500,13 @@ export default function Home() {
             {examinerSpeaking && (
               <div className="mt-2 text-green-600">🔊 Examiner is speaking...</div>
             )}
+            {testComplete && (
+              <div className="mt-2 text-red-600 font-semibold">✅ Test Complete - Evaluation Below</div>
+            )}
           </div>
 
           {/* Current Question Display */}
-          {conversation.length > 1 && (
+          {conversation.length > 1 && !testComplete && (
             <div className="bg-blue-50 p-4 rounded-lg">
               <h3 className="font-semibold mb-2">Current Question:</h3>
               <p className="text-lg">{conversation[1]?.content}</p>
@@ -346,25 +530,27 @@ export default function Home() {
           </div>
 
           {/* Recording Controls for Conversation */}
-          <div className="flex gap-4">
-            <button 
-              onClick={startRecording} 
-              disabled={recording || examinerSpeaking}
-              className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:opacity-50"
-            >
-              {recording ? 'Recording...' : 'Start Speaking'}
-            </button>
-            <button 
-              onClick={stopRecording} 
-              disabled={!recording}
-              className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 disabled:opacity-50"
-            >
-              Stop Speaking
-            </button>
-          </div>
+          {!testComplete && (
+            <div className="flex gap-4">
+              <button 
+                onClick={startRecording} 
+                disabled={recording || examinerSpeaking}
+                className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:opacity-50"
+              >
+                {recording ? 'Recording...' : 'Start Speaking'}
+              </button>
+              <button 
+                onClick={stopRecording} 
+                disabled={!recording}
+                className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 disabled:opacity-50"
+              >
+                Stop Speaking
+              </button>
+            </div>
+          )}
 
           {/* Audio Player and Processing */}
-          {audioBlob && (
+          {audioBlob && !testComplete && (
             <div className="space-y-4">
               <audio controls src={URL.createObjectURL(audioBlob)} className="w-full" />
               <button 
@@ -378,7 +564,7 @@ export default function Home() {
           )}
 
           {/* Process Response */}
-          {transcription && (
+          {transcription && !testComplete && (
             <div className="space-y-4">
               <h3 className="font-semibold">Your Response:</h3>
               <p className="bg-gray-50 p-4 rounded">{transcription}</p>
@@ -389,6 +575,53 @@ export default function Home() {
               >
                 Send Response
               </button>
+            </div>
+          )}
+
+          {/* Final Evaluation Results */}
+          {testComplete && evaluation && (
+            <div className="space-y-4">
+              <h3 className="font-semibold text-xl">🎯 IELTS Speaking Test Results</h3>
+              <div className="bg-white border rounded-lg p-6">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                  <div className="text-center">
+                    <div className="text-2xl font-bold text-blue-600">{evaluation.scores.overall}</div>
+                    <div className="text-sm text-gray-600">Overall</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xl font-bold text-green-600">{evaluation.scores.fluency_coherence}</div>
+                    <div className="text-sm text-gray-600">Fluency</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xl font-bold text-purple-600">{evaluation.scores.lexical_resource}</div>
+                    <div className="text-sm text-gray-600">Vocabulary</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xl font-bold text-orange-600">{evaluation.scores.grammatical_range}</div>
+                    <div className="text-sm text-gray-600">Grammar</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xl font-bold text-red-600">{evaluation.scores.pronunciation}</div>
+                    <div className="text-sm text-gray-600">Pronunciation</div>
+                  </div>
+                </div>
+                
+                <div className="space-y-4">
+                  <div>
+                    <h4 className="font-semibold mb-2">Band Descriptor:</h4>
+                    <p className="text-gray-700">{evaluation.band_descriptor}</p>
+                  </div>
+                  
+                  <div>
+                    <h4 className="font-semibold mb-2">Recommendations:</h4>
+                    <ul className="list-disc list-inside space-y-1">
+                      {evaluation.recommendations.map((rec: string, i: number) => (
+                        <li key={i} className="text-gray-700">{rec}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 
